@@ -1,0 +1,7 @@
+.idea/
+.vscode/
+coverage.out
+*.wav
+*.mp3
+*.ogg
+*.flac
