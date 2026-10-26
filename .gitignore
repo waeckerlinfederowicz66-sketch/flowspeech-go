@@ -5,3 +5,7 @@ coverage.out
 *.mp3
 *.ogg
 *.flac
+/.tools/
+/.cache/
+/dist/
+/go*.tar.gz

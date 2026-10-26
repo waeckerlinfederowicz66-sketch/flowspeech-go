@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	flowspeech "github.com/waeckerlinfederowicz66-sketch/flowspeech-go"
 )
@@ -14,9 +15,17 @@ func ExampleClient_Synthesize() {
 		panic(err)
 	}
 
-	audio, err := client.Synthesize(context.Background(), flowspeech.SynthesisRequest{
-		Text:     "Welcome to FlowSpeech.",
-		Speakers: []flowspeech.Speaker{{VoiceName: "Kore"}},
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	requestID, err := flowspeech.NewRequestID()
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("Persist this request ID for recovery:", requestID)
+	audio, err := client.Synthesize(ctx, flowspeech.SynthesisRequest{
+		Text:      "Welcome to FlowSpeech.",
+		RequestID: requestID,
+		Speakers:  []flowspeech.Speaker{{VoiceName: "Kore"}},
 	})
 	if err != nil {
 		panic(err)

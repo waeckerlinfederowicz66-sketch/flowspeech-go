@@ -2,84 +2,325 @@ package flowspeech
 
 import (
 	"context"
-	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
-func TestSynthesize(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/ai/text-to-speech" {
-			t.Fatalf("unexpected path: %s", r.URL.Path)
+const jobID = "b698824b-de05-486d-8833-05d5c4522a39"
+const requestID = "51382b81-9d36-49a5-994e-9b67686c6bd1"
+
+type transportFunc func(*http.Request) (*http.Response, error)
+
+func (f transportFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+func response(status int, body string, headers ...string) *http.Response {
+	h := make(http.Header)
+	for i := 0; i < len(headers); i += 2 {
+		h.Set(headers[i], headers[i+1])
+	}
+	return &http.Response{StatusCode: status, Header: h, Body: io.NopCloser(strings.NewReader(body))}
+}
+func job(status string) *Job {
+	j := &Job{ID: jobID, RequestID: requestID, Status: status, Usage: Usage{BillableCharacters: 5, ChargedCredits: 5}}
+	if status == "success" {
+		j.Result = &Result{URL: "https://audio.example.test/speech.wav", MIMEType: "audio/wav", SampleRate: 24000, Channels: 1, BitsPerSample: 16}
+	}
+	return j
+}
+func jobResponse(status string, code int) *http.Response {
+	b, _ := json.Marshal(job(status))
+	return response(code, string(b), "Retry-After", "7")
+}
+func client(t *testing.T, f transportFunc) *Client {
+	t.Helper()
+	c, err := NewClient("fixture-key", WithHTTPClient(&http.Client{Transport: f}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.sleep = func(context.Context, time.Duration) error { return nil }
+	return c
+}
+func TestSynthesizeLifecycle(t *testing.T) {
+	statuses := []string{"queued", "running", "merging", "settling", "success"}
+	calls := 0
+	var sleeps []time.Duration
+	c := client(t, func(r *http.Request) (*http.Response, error) {
+		if r.Header.Get("Authorization") != "Bearer fixture-key" {
+			t.Fatal("missing bearer")
 		}
-		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
-			t.Fatalf("unexpected authorization: %q", got)
+		if calls == 0 {
+			if r.Method != "POST" || r.URL.Path != jobsPath || r.Header.Get("Idempotency-Key") != requestID {
+				t.Fatal("bad create")
+			}
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			want := map[string]any{"input": map[string]any{"mode": "single", "text": "Hello", "voiceName": "Kore"}}
+			if !reflect.DeepEqual(body, want) {
+				t.Fatalf("body %#v", body)
+			}
+		} else if r.Method != "GET" || r.URL.Path != jobsPath+"/"+jobID {
+			t.Fatal("bad poll")
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"code":0,"message":"ok","data":{"mimeType":"audio/wav","audioBase64":"aGVsbG8=","sampleRate":24000,"numChannels":1,"bitsPerSample":16}}`))
-	}))
-	defer server.Close()
-
-	client, err := NewClient("test-key", WithBaseURL(server.URL))
+		status := statuses[calls]
+		calls++
+		return jobResponse(status, 200), nil
+	})
+	c.sleep = func(_ context.Context, d time.Duration) error { sleeps = append(sleeps, d); return nil }
+	c.downloadClient = isolatedClient(&http.Client{Transport: transportFunc(func(r *http.Request) (*http.Response, error) {
+		if len(r.Header) != 0 {
+			t.Fatalf("download headers: %#v", r.Header)
+		}
+		return response(200, string(validWAV())), nil
+	})})
+	a, err := c.Synthesize(context.Background(), SynthesisRequest{Text: "Hello", RequestID: requestID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	audio, err := client.Synthesize(context.Background(), SynthesisRequest{Text: "Hello"})
-	if err != nil {
-		t.Fatal(err)
+	b, err := a.Bytes()
+	if err != nil || !reflect.DeepEqual(b, validWAV()) || a.JobID != jobID || a.NumChannels != 1 || a.Usage.ChargedCredits != 5 {
+		t.Fatalf("bad audio %#v %v", a, err)
 	}
-	data, err := audio.Bytes()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "hello" {
-		t.Fatalf("unexpected audio: %q", data)
+	if calls != 5 || !reflect.DeepEqual(sleeps, []time.Duration{7 * time.Second, 7 * time.Second, 7 * time.Second, 7 * time.Second}) {
+		t.Fatalf("calls %d sleeps %v", calls, sleeps)
 	}
 }
-
-func TestQuota(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"code":0,"message":"ok","data":{"quota":{"limit":10000,"used":120,"remaining":9880,"isGuest":false}}}`))
-	}))
-	defer server.Close()
-
-	client, _ := NewClient("test-key", WithBaseURL(server.URL))
-	quota, err := client.Quota(context.Background())
+func TestMultiAndValidation(t *testing.T) {
+	c := client(t, func(r *http.Request) (*http.Response, error) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		input := body["input"].(map[string]any)
+		if len(body) != 1 || len(input) != 2 || input["mode"] != "multi" || len(input["segments"].([]any)) != 2 {
+			t.Fatal(body)
+		}
+		return jobResponse("queued", 202), nil
+	})
+	_, err := c.CreateJob(context.Background(), SynthesisRequest{RequestID: requestID, Segments: []Segment{{"Alice", "Hello", "Kore"}, {"Bob", "Hi", "Puck"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if quota.Remaining != 9880 {
-		t.Fatalf("unexpected remaining quota: %d", quota.Remaining)
+	invalid := []SynthesisRequest{{}, {Text: "Hi", OriginalText: "Hi"}, {Text: "Hi", Speakers: []Speaker{{"A", "Kore"}}}, {Segments: []Segment{}}, {Text: "Hi", Segments: []Segment{{"A", "Hi", "Kore"}}}, {Text: "Hi", Speakers: []Speaker{{VoiceName: ""}}}, {Segments: []Segment{{"", "Hi", "Kore"}}}}
+	for _, r := range invalid {
+		if _, err := r.input(); err == nil {
+			t.Fatalf("accepted %#v", r)
+		}
 	}
 }
-
-func TestAPIError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Retry-After", "5")
-		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = w.Write([]byte(`{"code":-1,"message":"slow down","data":{"errorCode":"RATE_LIMITED","retryable":true}}`))
+func TestRetryKeepsUUIDAndBody(t *testing.T) {
+	var bodies, ids []string
+	var sleeps []time.Duration
+	c := client(t, func(r *http.Request) (*http.Response, error) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		ids = append(ids, r.Header.Get("Idempotency-Key"))
+		switch len(bodies) {
+		case 1:
+			return nil, io.ErrUnexpectedEOF
+		case 2:
+			return response(503, `{"error":{"code":"busy","retryable":true},"traceId":"trace"}`, "Retry-After", "12"), nil
+		default:
+			j := job("queued")
+			j.RequestID = ids[0]
+			data, _ := json.Marshal(j)
+			return response(202, string(data)), nil
+		}
+	})
+	c.sleep = func(_ context.Context, d time.Duration) error { sleeps = append(sleeps, d); return nil }
+	j, err := c.CreateJob(context.Background(), SynthesisRequest{Text: "Hi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !uuidPattern.MatchString(j.RequestID) || ids[0] != ids[1] || ids[1] != ids[2] || bodies[0] != bodies[1] || bodies[1] != bodies[2] {
+		t.Fatal(ids, bodies)
+	}
+	if !reflect.DeepEqual(sleeps, []time.Duration{5 * time.Second, 12 * time.Second}) {
+		t.Fatal(sleeps)
+	}
+}
+func TestQuotaVoicesRecoveryCancel(t *testing.T) {
+	c := client(t, func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/api/v1/quota":
+			return response(200, `{"quota":{"remaining":10,"reserved":3,"available":7},"entitlement":{"plan":"basic"},"subscription":{"status":"active"},"limits":{"readPerMinute":60}}`), nil
+		case "/api/v1/voices":
+			return response(200, `{"voices":[{"name":"Kore","gender":"female","description":"Firm"}]}`), nil
+		case jobsPath:
+			if r.URL.Query().Get("requestId") != requestID {
+				t.Fatal(r.URL)
+			}
+			return jobResponse("queued", 200), nil
+		case jobsPath + "/" + jobID + "/cancel":
+			if r.Method != "POST" {
+				t.Fatal(r.Method)
+			}
+			return jobResponse("cancelled", 200), nil
+		}
+		t.Fatal(r.URL)
+		return nil, nil
+	})
+	q, err := c.Quota(context.Background())
+	if err != nil || q.Available != 7 || len(q.Entitlement) == 0 || len(q.Subscription) == 0 || len(q.Limits) == 0 {
+		t.Fatal(q, err)
+	}
+	v, err := c.Voices(context.Background())
+	if err != nil || v[0].Name != "Kore" {
+		t.Fatal(v, err)
+	}
+	if _, err := c.FindJob(context.Background(), requestID); err != nil {
+		t.Fatal(err)
+	}
+	if j, err := c.CancelJob(context.Background(), jobID); err != nil || j.Status != "cancelled" {
+		t.Fatal(j, err)
+	}
+	if _, err := c.GetJob(context.Background(), "../../evil"); err == nil {
+		t.Fatal("accepted ID")
+	}
+}
+func TestErrorsAndBoundedRetries(t *testing.T) {
+	for _, status := range []int{401, 403, 409, 429, 503} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			calls := 0
+			c := client(t, func(*http.Request) (*http.Response, error) {
+				calls++
+				return response(status, `{"error":{"code":"fixture_error","message":"rejected","retryable":true},"traceId":"fixture-trace"}`, "Retry-After", "9"), nil
+			})
+			_, err := c.CreateJob(context.Background(), SynthesisRequest{Text: "Hi", RequestID: requestID})
+			var api *APIError
+			var op *OperationError
+			if !errors.As(err, &api) || !errors.As(err, &op) || op.RequestID != requestID || api.TraceID != "fixture-trace" || api.ErrorCode != "fixture_error" || api.RetryAfter != "9" {
+				t.Fatal(err)
+			}
+			want := 1
+			if status == 429 || status == 503 {
+				want = 3
+			}
+			if calls != want {
+				t.Fatal(calls)
+			}
+		})
+	}
+}
+func TestTerminalAndMalformed(t *testing.T) {
+	c := client(t, func(*http.Request) (*http.Response, error) { t.Fatal("unexpected request"); return nil, nil })
+	for _, status := range []string{"failed", "cancelled"} {
+		_, err := c.WaitJob(context.Background(), job(status))
+		if err == nil || !strings.Contains(err.Error(), status) {
+			t.Fatal(err)
+		}
+	}
+	deleted := job("success")
+	deleted.Result = nil
+	deleted.ResultDeleted = true
+	if _, err := c.WaitJob(context.Background(), deleted); err == nil || !strings.Contains(err.Error(), "deleted") {
+		t.Fatal(err)
+	}
+	for _, j := range []*Job{nil, {ID: jobID, Status: "unknown"}, {Status: "queued"}, {ID: jobID, Status: "success"}, {ID: jobID, Status: "success", Result: &Result{URL: "https://example.test"}}} {
+		if validateJob(j) == nil {
+			t.Fatal(j)
+		}
+	}
+	for _, body := range []string{`null`, `[]`, `{`, `{"status":"queued"}`, `{"id":"` + jobID + `","status":"alien"}`} {
+		c := client(t, func(*http.Request) (*http.Response, error) { return response(200, body), nil })
+		if _, err := c.GetJob(context.Background(), jobID); err == nil {
+			t.Fatal(body)
+		}
+	}
+}
+func TestDeadlineAndRetryAfter(t *testing.T) {
+	c := client(t, func(*http.Request) (*http.Response, error) { return jobResponse("queued", 202), nil })
+	c.timeout = 20 * time.Millisecond
+	c.sleep = wait
+	start := time.Now()
+	_, err := c.Synthesize(context.Background(), SynthesisRequest{Text: "Hi", RequestID: requestID})
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
+		t.Fatal(err)
+	}
+	d := retryDelay(time.Now().Add(20*time.Second).UTC().Format(http.TimeFormat), 5*time.Second)
+	if d < 18*time.Second || d > 21*time.Second {
+		t.Fatal(d)
+	}
+	if retryDelay("bad", 5*time.Second) != 5*time.Second || retryDelay("1", 5*time.Second) != 5*time.Second {
+		t.Fatal("bad default delay")
+	}
+	c = client(t, func(r *http.Request) (*http.Response, error) { <-r.Context().Done(); return nil, r.Context().Err() })
+	c.timeout = 20 * time.Millisecond
+	if _, err = c.Quota(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal(err)
+	}
+}
+func TestDownloadFailureDoesNotCreate(t *testing.T) {
+	calls := 0
+	c := client(t, func(*http.Request) (*http.Response, error) { calls++; return jobResponse("success", 200), nil })
+	c.downloadClient = isolatedClient(&http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) { return response(503, "unavailable"), nil })})
+	_, err := c.Synthesize(context.Background(), SynthesisRequest{Text: "Hi", RequestID: requestID})
+	var op *OperationError
+	if !errors.As(err, &op) || op.JobID != jobID || calls != 1 {
+		t.Fatal(err, calls)
+	}
+	c.maxDownloadBytes = 2
+	c.downloadClient = isolatedClient(&http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) { return response(200, "123"), nil })})
+	if _, err = c.Download(context.Background(), job("success")); err == nil {
+		t.Fatal("unbounded")
+	}
+	if calls != 1 {
+		t.Fatal(calls)
+	}
+}
+func TestRedirectsAndCookies(t *testing.T) {
+	hits := 0
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++ }))
+	defer target.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Cookie") != "" {
+			t.Error("cookie leaked")
+		}
+		http.Redirect(w, r, target.URL, http.StatusFound)
 	}))
-	defer server.Close()
-
-	client, _ := NewClient("test-key", WithBaseURL(server.URL))
-	_, err := client.Quota(context.Background())
-	var apiErr *APIError
-	if !errors.As(err, &apiErr) {
-		t.Fatalf("expected APIError, got %T", err)
+	defer origin.Close()
+	jar, _ := cookiejar.New(nil)
+	u, _ := url.Parse(origin.URL)
+	jar.SetCookies(u, []*http.Cookie{{Name: "session", Value: "fixture"}})
+	h := &http.Client{Jar: jar}
+	c, err := NewClient("fixture-key", WithBaseURL(origin.URL), WithHTTPClient(h), WithDownloadHTTPClient(h))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !apiErr.Retryable || apiErr.RetryAfter != "5" {
-		t.Fatalf("unexpected APIError: %#v", apiErr)
+	if _, err = c.Quota(context.Background()); err == nil {
+		t.Fatal("API redirect accepted")
+	}
+	j := job("success")
+	j.Result.URL = origin.URL
+	if _, err = c.Download(context.Background(), j); err == nil {
+		t.Fatal("download redirect accepted")
+	}
+	if hits != 0 || h.Jar == nil || h.CheckRedirect != nil {
+		t.Fatal("followed redirect or mutated caller")
 	}
 }
-
-func TestAudioBytesRejectsInvalidBase64(t *testing.T) {
-	_, err := (Audio{AudioBase64: "%%%"}).Bytes()
-	if err == nil {
-		t.Fatal("expected an error")
+func TestConfiguration(t *testing.T) {
+	for _, key := range []string{"", " ", "bad\r\nkey", "key value"} {
+		if _, err := NewClient(key); err == nil {
+			t.Fatal("accepted key")
+		}
 	}
-	if _, ok := err.(base64.CorruptInputError); ok {
-		t.Fatal("expected a contextual error")
+	for _, raw := range []string{"file:///tmp/x", "http://example.test", "https://user:pass@example.test", "https://example.test/#x", "https://example.test/api"} {
+		if _, err := NewClient("fixture-key", WithBaseURL(raw)); err == nil {
+			t.Fatal(raw)
+		}
+	}
+	for _, o := range []Option{WithTimeout(0), WithPollInterval(time.Second), WithMaxRetries(-1), WithMaxDownloadBytes(0), WithHTTPClient(nil), WithDownloadHTTPClient(nil), nil} {
+		if _, err := NewClient("fixture-key", o); err == nil {
+			t.Fatal("accepted option")
+		}
+	}
+	if _, err := (Audio{AudioBase64: "%%%"}).Bytes(); err == nil {
+		t.Fatal("invalid base64")
 	}
 }

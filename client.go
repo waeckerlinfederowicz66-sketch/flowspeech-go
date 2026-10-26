@@ -1,9 +1,10 @@
-// Package flowspeech provides a small Go client for the FlowSpeech text-to-speech API.
+// Package flowspeech implements the server-side FlowSpeech public API v1.
 package flowspeech
 
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -11,90 +12,201 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
 
+const Version = "0.2.0"
 const defaultBaseURL = "https://flowspeech.io"
+const jobsPath = "/api/v1/tts/jobs"
 
-// Client calls the FlowSpeech API.
+var uuidPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// Client is safe for concurrent use. Injected transports must be trusted: they
+// must not add credentials, cookies, or follow redirects themselves.
 type Client struct {
-	baseURL    *url.URL
-	apiKey     string
-	httpClient *http.Client
+	baseURL                    *url.URL
+	apiKey                     string
+	httpClient, downloadClient *http.Client
+	timeout, pollInterval      time.Duration
+	maxRetries                 int
+	maxDownloadBytes           int64
+	sleep                      func(context.Context, time.Duration) error
 }
-
-// Option customizes a Client.
 type Option func(*Client) error
 
-// WithBaseURL replaces the default API base URL. It is primarily useful for tests.
-func WithBaseURL(rawURL string) Option {
+// WithBaseURL accepts HTTPS, or HTTP loopback URLs for local tests.
+func WithBaseURL(raw string) Option {
 	return func(c *Client) error {
-		u, err := url.Parse(rawURL)
+		u, err := safeURL(raw)
 		if err != nil {
-			return fmt.Errorf("parse base URL: %w", err)
+			return err
 		}
-		if u.Scheme == "" || u.Host == "" {
-			return errors.New("base URL must include a scheme and host")
+		if (u.Path != "" && u.Path != "/") || u.RawQuery != "" {
+			return errors.New("base URL must be an origin")
 		}
 		c.baseURL = u
 		return nil
 	}
 }
 
-// WithHTTPClient replaces the default HTTP client.
-func WithHTTPClient(httpClient *http.Client) Option {
+// WithHTTPClient configures API requests only. Its cookie jar is removed and
+// redirects disabled on a copy; the caller's client is not modified.
+func WithHTTPClient(h *http.Client) Option {
 	return func(c *Client) error {
-		if httpClient == nil {
-			return errors.New("HTTP client cannot be nil")
+		if h == nil {
+			return errors.New("nil HTTP client")
 		}
-		c.httpClient = httpClient
+		c.httpClient = h
 		return nil
 	}
 }
 
-// NewClient creates a FlowSpeech API client. The API key is sent only as a Bearer token.
-func NewClient(apiKey string, options ...Option) (*Client, error) {
-	baseURL, _ := url.Parse(defaultBaseURL)
-	c := &Client{
-		baseURL: baseURL,
-		apiKey:  strings.TrimSpace(apiKey),
-		httpClient: &http.Client{
-			Timeout: 90 * time.Second,
-		},
+// WithDownloadHTTPClient configures the separate, credential-free audio client.
+func WithDownloadHTTPClient(h *http.Client) Option {
+	return func(c *Client) error {
+		if h == nil {
+			return errors.New("nil download client")
+		}
+		c.downloadClient = h
+		return nil
 	}
+}
 
+// WithTimeout bounds each operation, including polling and downloading.
+// An earlier context deadline always wins.
+func WithTimeout(d time.Duration) Option {
+	return func(c *Client) error {
+		if d <= 0 {
+			return errors.New("timeout must be positive")
+		}
+		c.timeout = d
+		return nil
+	}
+}
+func WithPollInterval(d time.Duration) Option {
+	return func(c *Client) error {
+		if d < 5*time.Second {
+			return errors.New("poll interval must be at least five seconds")
+		}
+		c.pollInterval = d
+		return nil
+	}
+}
+func WithMaxRetries(n int) Option {
+	return func(c *Client) error {
+		if n < 0 || n > 10 {
+			return errors.New("max retries must be 0..10")
+		}
+		c.maxRetries = n
+		return nil
+	}
+}
+func WithMaxDownloadBytes(n int64) Option {
+	return func(c *Client) error {
+		if n <= 0 || n > 1<<30 {
+			return errors.New("download limit must be 1..1073741824 bytes")
+		}
+		c.maxDownloadBytes = n
+		return nil
+	}
+}
+func NewClient(apiKey string, options ...Option) (*Client, error) {
+	if apiKey == "" || strings.ContainsAny(apiKey, " \t\r\n") {
+		return nil, errors.New("a nonempty API key without whitespace is required")
+	}
+	u, _ := url.Parse(defaultBaseURL)
+	c := &Client{baseURL: u, apiKey: apiKey, httpClient: &http.Client{}, downloadClient: &http.Client{}, timeout: 10 * time.Minute, pollInterval: 5 * time.Second, maxRetries: 2, maxDownloadBytes: 64 << 20, sleep: wait}
 	for _, option := range options {
+		if option == nil {
+			return nil, errors.New("nil option")
+		}
 		if err := option(c); err != nil {
 			return nil, err
 		}
 	}
+	c.httpClient = isolatedClient(c.httpClient)
+	c.downloadClient = isolatedClient(c.downloadClient)
 	return c, nil
 }
+func isolatedClient(h *http.Client) *http.Client {
+	copy := *h
+	copy.Jar = nil
+	copy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	if copy.Timeout <= 0 || copy.Timeout > 30*time.Second {
+		copy.Timeout = 30 * time.Second
+	}
+	return &copy
+}
 
-// Speaker assigns a FlowSpeech voice to an optional speaker label.
 type Speaker struct {
 	Speaker   string `json:"speaker,omitempty"`
 	VoiceName string `json:"voiceName"`
 }
+type Segment struct {
+	Speaker   string `json:"speaker"`
+	Text      string `json:"text"`
+	VoiceName string `json:"voiceName"`
+}
 
-// SynthesisRequest describes a single-speaker or multi-speaker request.
+// SynthesisRequest retains the legacy single-voice signature. For dialogue use
+// Segments, not a labelled Text script. OriginalText is unsupported.
 type SynthesisRequest struct {
-	Text         string    `json:"text"`
-	OriginalText string    `json:"originalText,omitempty"`
-	Speakers     []Speaker `json:"speakers"`
+	Text, OriginalText string
+	Speakers           []Speaker
+	Segments           []Segment
+	RequestID          string
 }
 
-// Quota describes the current account allowance.
+// Quota retains legacy fields for source compatibility; v1 only populates
+// Remaining, Reserved, Available, Entitlement/Subscription and Limits.
 type Quota struct {
-	Limit     int        `json:"limit"`
-	Used      int        `json:"used"`
-	Remaining int        `json:"remaining"`
-	ResetAt   *time.Time `json:"resetAt,omitempty"`
-	IsGuest   bool       `json:"isGuest"`
+	Remaining    int             `json:"remaining"`
+	Reserved     int             `json:"reserved"`
+	Available    int             `json:"available"`
+	Entitlement  json.RawMessage `json:"-"`
+	Subscription json.RawMessage `json:"-"`
+	Limits       json.RawMessage `json:"-"`
+	Limit        int             `json:"-"`
+	Used         int             `json:"-"`
+	ResetAt      *time.Time      `json:"-"`
+	IsGuest      bool            `json:"-"`
+}
+type Voice struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Gender      string `json:"gender"`
+}
+type Usage struct {
+	BillableCharacters int `json:"billableCharacters"`
+	ReservedCredits    int `json:"reservedCredits"`
+	ChargedCredits     int `json:"chargedCredits"`
+}
+type Result struct {
+	URL           string `json:"url"`
+	MIMEType      string `json:"mimeType"`
+	SampleRate    int    `json:"sampleRate"`
+	Channels      int    `json:"channels"`
+	BitsPerSample int    `json:"bitsPerSample"`
+}
+type JobFailure struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+type Job struct {
+	ID            string      `json:"id"`
+	RequestID     string      `json:"requestId"`
+	Status        string      `json:"status"`
+	Result        *Result     `json:"result"`
+	ResultDeleted bool        `json:"resultDeleted"`
+	Usage         Usage       `json:"usage"`
+	Error         *JobFailure `json:"error"`
+	RetryAfter    string      `json:"-"`
 }
 
-// Audio contains generated audio and format metadata.
+// AudioBase64 is encoded locally from downloaded WAV bytes, never returned by v1.
 type Audio struct {
 	MIMEType      string `json:"mimeType"`
 	AudioBase64   string `json:"audioBase64"`
@@ -102,141 +214,402 @@ type Audio struct {
 	SampleRate    int    `json:"sampleRate"`
 	NumChannels   int    `json:"numChannels"`
 	BitsPerSample int    `json:"bitsPerSample"`
+	JobID         string `json:"jobId"`
+	RequestID     string `json:"requestId"`
+	Usage         Usage  `json:"usage"`
 }
 
-// Bytes decodes the generated base64 audio.
-func (a Audio) Bytes() ([]byte, error) {
-	data, err := base64.StdEncoding.DecodeString(a.AudioBase64)
-	if err != nil {
-		return nil, fmt.Errorf("decode audio: %w", err)
-	}
-	return data, nil
-}
+func (a Audio) Bytes() ([]byte, error) { return base64.StdEncoding.DecodeString(a.AudioBase64) }
 
-// APIError is returned when FlowSpeech rejects a request.
 type APIError struct {
-	StatusCode int
-	Code       int
-	Message    string
-	ErrorCode  string
-	Retryable  bool
-	RetryAfter string
+	StatusCode                              int
+	Code                                    int // Deprecated: use ErrorCode for v1 string codes.
+	Message, ErrorCode, RetryAfter, TraceID string
+	Retryable                               bool
 }
 
 func (e *APIError) Error() string {
-	if e.ErrorCode != "" {
-		return fmt.Sprintf("flowspeech: %s (%s, HTTP %d)", e.Message, e.ErrorCode, e.StatusCode)
+	return fmt.Sprintf("flowspeech: %s (%s, HTTP %d)", e.Message, e.ErrorCode, e.StatusCode)
+}
+
+// OperationError preserves recovery identifiers even after a lost create response.
+type OperationError struct {
+	RequestID, JobID string
+	Err              error
+}
+
+func (e *OperationError) Error() string {
+	return fmt.Sprintf("flowspeech request %s job %s: %v", e.RequestID, e.JobID, e.Err)
+}
+func (e *OperationError) Unwrap() error { return e.Err }
+func NewRequestID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
 	}
-	return fmt.Sprintf("flowspeech: %s (HTTP %d)", e.Message, e.StatusCode)
+	b[6] = (b[6] & 15) | 64
+	b[8] = (b[8] & 63) | 128
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[:4], b[4:6], b[6:8], b[8:10], b[10:]), nil
 }
-
-type envelope[T any] struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-	Data    T      `json:"data"`
-}
-
-type errorData struct {
-	ErrorCode string `json:"errorCode"`
-	Retryable bool   `json:"retryable"`
-}
-
-// Quota returns the authenticated account's current TTS quota.
 func (c *Client) Quota(ctx context.Context) (*Quota, error) {
-	var response envelope[struct {
-		Quota Quota `json:"quota"`
-	}]
-	if err := c.do(ctx, http.MethodGet, "/api/ai/text-to-speech/quota", nil, &response); err != nil {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	var out struct {
+		Quota        *Quota          `json:"quota"`
+		Entitlement  json.RawMessage `json:"entitlement"`
+		Subscription json.RawMessage `json:"subscription"`
+		Limits       json.RawMessage `json:"limits"`
+	}
+	_, err := c.request(ctx, "GET", "/api/v1/quota", nil, "", &out)
+	if err != nil {
 		return nil, err
 	}
-	return &response.Data.Quota, nil
+	if out.Quota == nil {
+		return nil, errors.New("missing quota")
+	}
+	out.Quota.Entitlement, out.Quota.Subscription, out.Quota.Limits = out.Entitlement, out.Subscription, out.Limits
+	return out.Quota, nil
 }
-
-// Synthesize generates speech from text and one or more voice assignments.
-func (c *Client) Synthesize(ctx context.Context, request SynthesisRequest) (*Audio, error) {
-	if strings.TrimSpace(request.Text) == "" {
-		return nil, errors.New("flowspeech: text is required")
+func (c *Client) Voices(ctx context.Context) ([]Voice, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	var out struct {
+		Voices []Voice `json:"voices"`
 	}
-	if len(request.Speakers) == 0 {
-		request.Speakers = []Speaker{{VoiceName: "Kore"}}
+	_, err := c.request(ctx, "GET", "/api/v1/voices", nil, "", &out)
+	if err == nil && out.Voices == nil {
+		err = errors.New("missing voices")
 	}
-	for _, speaker := range request.Speakers {
-		if strings.TrimSpace(speaker.VoiceName) == "" {
-			return nil, errors.New("flowspeech: every speaker requires a voice name")
+	return out.Voices, err
+}
+func (r SynthesisRequest) input() (any, error) {
+	if r.OriginalText != "" {
+		return nil, errors.New("OriginalText is unsupported by v1")
+	}
+	if r.Segments != nil {
+		if len(r.Segments) == 0 || r.Text != "" || len(r.Speakers) > 0 {
+			return nil, errors.New("use nonempty Segments without Text or Speakers")
 		}
+		for _, s := range r.Segments {
+			if strings.TrimSpace(s.Speaker) == "" || strings.TrimSpace(s.Text) == "" || strings.TrimSpace(s.VoiceName) == "" {
+				return nil, errors.New("each segment requires speaker, text and voiceName")
+			}
+		}
+		return struct {
+			Mode     string    `json:"mode"`
+			Segments []Segment `json:"segments"`
+		}{"multi", r.Segments}, nil
 	}
-	if request.OriginalText == "" {
-		request.OriginalText = request.Text
+	if strings.TrimSpace(r.Text) == "" {
+		return nil, errors.New("text is required")
 	}
-
-	var response envelope[Audio]
-	if err := c.do(ctx, http.MethodPost, "/api/ai/text-to-speech", request, &response); err != nil {
+	voice := "Kore"
+	if len(r.Speakers) > 1 || (len(r.Speakers) == 1 && r.Speakers[0].Speaker != "") {
+		return nil, errors.New("legacy labelled speakers are unsupported; use Segments")
+	}
+	if len(r.Speakers) == 1 {
+		voice = r.Speakers[0].VoiceName
+	}
+	if strings.TrimSpace(voice) == "" {
+		return nil, errors.New("voiceName is required")
+	}
+	return struct {
+		Mode      string `json:"mode"`
+		Text      string `json:"text"`
+		VoiceName string `json:"voiceName"`
+	}{"single", r.Text, voice}, nil
+}
+func (c *Client) CreateJob(ctx context.Context, r SynthesisRequest) (*Job, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	input, err := r.input()
+	if err != nil {
 		return nil, err
 	}
-	if response.Data.AudioBase64 == "" {
-		return nil, errors.New("flowspeech: response did not include audio")
-	}
-	return &response.Data, nil
-}
-
-func (c *Client) do(ctx context.Context, method, path string, body, output any) error {
-	if c == nil || c.baseURL == nil || c.httpClient == nil {
-		return errors.New("flowspeech: client is not initialized")
-	}
-	endpoint := c.baseURL.ResolveReference(&url.URL{Path: path})
-
-	var reader io.Reader
-	if body != nil {
-		encoded, err := json.Marshal(body)
+	id := r.RequestID
+	if id == "" {
+		id, err = NewRequestID()
 		if err != nil {
-			return fmt.Errorf("encode request: %w", err)
+			return nil, err
 		}
-		reader = bytes.NewReader(encoded)
 	}
-
-	req, err := http.NewRequestWithContext(ctx, method, endpoint.String(), reader)
+	if !uuidPattern.MatchString(id) {
+		return nil, errors.New("request ID must be a UUID")
+	}
+	body, err := json.Marshal(map[string]any{"input": input})
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return nil, err
 	}
-	req.Header.Set("Accept", "application/json")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+	j, err := c.jobRequest(ctx, "POST", jobsPath, body, id)
+	if err != nil {
+		return nil, &OperationError{RequestID: id, Err: err}
 	}
-	if c.apiKey != "" {
+	if j.RequestID != "" && !strings.EqualFold(j.RequestID, id) {
+		return nil, &OperationError{RequestID: id, JobID: j.ID, Err: errors.New("request ID mismatch")}
+	}
+	j.RequestID = id
+	return j, nil
+}
+func (c *Client) GetJob(ctx context.Context, id string) (*Job, error) { return c.byID(ctx, id, false) }
+func (c *Client) CancelJob(ctx context.Context, id string) (*Job, error) {
+	return c.byID(ctx, id, true)
+}
+func (c *Client) byID(ctx context.Context, id string, cancelJob bool) (*Job, error) {
+	if !uuidPattern.MatchString(id) {
+		return nil, errors.New("job ID must be a UUID")
+	}
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	method, path := "GET", jobsPath+"/"+id
+	if cancelJob {
+		method = "POST"
+		path += "/cancel"
+	}
+	j, err := c.jobRequest(ctx, method, path, nil, "")
+	if err == nil && !strings.EqualFold(j.ID, id) {
+		err = errors.New("job ID mismatch")
+	}
+	if err != nil {
+		return nil, &OperationError{JobID: id, Err: err}
+	}
+	return j, nil
+}
+func (c *Client) FindJob(ctx context.Context, requestID string) (*Job, error) {
+	if !uuidPattern.MatchString(requestID) {
+		return nil, errors.New("request ID must be a UUID")
+	}
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	j, err := c.jobRequest(ctx, "GET", jobsPath+"?requestId="+url.QueryEscape(requestID), nil, "")
+	if err == nil && j.RequestID != "" && !strings.EqualFold(j.RequestID, requestID) {
+		err = errors.New("request ID mismatch")
+	}
+	if err != nil {
+		return nil, &OperationError{RequestID: requestID, Err: err}
+	}
+	j.RequestID = requestID
+	return j, nil
+}
+func (c *Client) jobRequest(ctx context.Context, method, path string, body []byte, id string) (*Job, error) {
+	var j Job
+	h, err := c.request(ctx, method, path, body, id, &j)
+	if err != nil {
+		return nil, err
+	}
+	j.RetryAfter = h.Get("Retry-After")
+	if err = validateJob(&j); err != nil {
+		return nil, err
+	}
+	return &j, nil
+}
+func validateJob(j *Job) error {
+	if j == nil || !uuidPattern.MatchString(j.ID) {
+		return errors.New("missing or invalid job ID")
+	}
+	if j.RequestID != "" && !uuidPattern.MatchString(j.RequestID) {
+		return errors.New("invalid request ID")
+	}
+	switch j.Status {
+	case "queued", "running", "merging", "settling", "failed", "cancelled":
+		return nil
+	case "success":
+		if j.ResultDeleted && j.Result == nil {
+			return nil
+		}
+		if j.ResultDeleted || j.Result == nil {
+			return errors.New("missing or inconsistent job result")
+		}
+		r := j.Result
+		if r.MIMEType != "audio/wav" || r.SampleRate != 24000 || r.Channels != 1 || r.BitsPerSample != 16 {
+			return errors.New("invalid WAV result metadata")
+		}
+		_, err := safeURL(r.URL)
+		return err
+	default:
+		return errors.New("unknown job status")
+	}
+}
+func (c *Client) WaitJob(ctx context.Context, j *Job) (*Job, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	if err := validateJob(j); err != nil {
+		return nil, err
+	}
+	requestID, jobID := j.RequestID, j.ID
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, &OperationError{RequestID: requestID, JobID: jobID, Err: err}
+		}
+		var err error
+		switch j.Status {
+		case "success":
+			if !j.ResultDeleted {
+				return j, nil
+			}
+			err = errors.New("audio result was deleted (resultDeleted=true)")
+		case "failed", "cancelled":
+			code := ""
+			if j.Error != nil {
+				code = j.Error.Code
+			}
+			err = fmt.Errorf("job %s: %s", j.Status, code)
+		default:
+			err = c.sleep(ctx, retryDelay(j.RetryAfter, c.pollInterval))
+			if err == nil {
+				j, err = c.GetJob(ctx, jobID)
+			}
+			if err == nil {
+				if j.RequestID != "" && requestID != "" && !strings.EqualFold(j.RequestID, requestID) {
+					err = errors.New("request ID mismatch")
+				} else {
+					j.RequestID = requestID
+					continue
+				}
+			}
+		}
+		return nil, &OperationError{RequestID: requestID, JobID: jobID, Err: err}
+	}
+}
+func (c *Client) Download(ctx context.Context, j *Job) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	if err := validateJob(j); err != nil {
+		return nil, err
+	}
+	if j.Status != "success" || j.ResultDeleted {
+		return nil, &OperationError{RequestID: j.RequestID, JobID: j.ID, Err: errors.New("job has no downloadable result (pending, failed, cancelled or deleted)")}
+	}
+	req, _ := http.NewRequestWithContext(ctx, "GET", j.Result.URL, nil)
+	resp, err := c.downloadClient.Do(req)
+	if err == nil {
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			err = fmt.Errorf("download HTTP %d; retry Download with the same job", resp.StatusCode)
+		} else {
+			var data []byte
+			data, err = readBounded(resp.Body, c.maxDownloadBytes)
+			if err == nil {
+				err = validateWAV(ctx, data)
+			}
+			if err == nil {
+				return data, nil
+			}
+		}
+	}
+	return nil, &OperationError{RequestID: j.RequestID, JobID: j.ID, Err: err}
+}
+func (c *Client) Synthesize(ctx context.Context, r SynthesisRequest) (*Audio, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	j, err := c.CreateJob(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	j, err = c.WaitJob(ctx, j)
+	if err != nil {
+		return nil, err
+	}
+	data, err := c.Download(ctx, j)
+	if err != nil {
+		return nil, err
+	}
+	v := j.Result
+	return &Audio{MIMEType: v.MIMEType, AudioBase64: base64.StdEncoding.EncodeToString(data), SampleRate: v.SampleRate, NumChannels: v.Channels, BitsPerSample: v.BitsPerSample, JobID: j.ID, RequestID: j.RequestID, Usage: j.Usage}, nil
+}
+func (c *Client) request(ctx context.Context, method, path string, body []byte, id string, out any) (http.Header, error) {
+	ref, _ := url.Parse(path)
+	u := c.baseURL.ResolveReference(ref)
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, method, u.String(), bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
-	if err != nil {
-		return fmt.Errorf("read response: %w", err)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var failure envelope[errorData]
-		_ = json.Unmarshal(responseBody, &failure)
-		message := failure.Message
-		if message == "" {
-			message = strings.TrimSpace(string(responseBody))
+		req.Header.Set("Accept", "application/json")
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
 		}
-		if message == "" {
-			message = http.StatusText(resp.StatusCode)
+		if id != "" {
+			req.Header.Set("Idempotency-Key", id)
 		}
-		return &APIError{
-			StatusCode: resp.StatusCode,
-			Code:       failure.Code,
-			Message:    message,
-			ErrorCode:  failure.Data.ErrorCode,
-			Retryable:  failure.Data.Retryable,
-			RetryAfter: resp.Header.Get("Retry-After"),
+		resp, err := c.httpClient.Do(req)
+		delay := c.pollInterval
+		if err == nil {
+			var data []byte
+			data, err = readBounded(resp.Body, 1<<20)
+			resp.Body.Close()
+			if err == nil {
+				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					err = json.Unmarshal(data, out)
+					return resp.Header, err
+				}
+				var failure struct {
+					Error struct {
+						Code, Message string
+						Retryable     bool
+					}
+					TraceID string `json:"traceId"`
+				}
+				_ = json.Unmarshal(data, &failure)
+				e := &APIError{StatusCode: resp.StatusCode, ErrorCode: failure.Error.Code, Message: failure.Error.Message, Retryable: failure.Error.Retryable, TraceID: failure.TraceID, RetryAfter: resp.Header.Get("Retry-After")}
+				if e.Message == "" {
+					e.Message = http.StatusText(resp.StatusCode)
+				}
+				if e.TraceID == "" {
+					e.TraceID = resp.Header.Get("X-Request-Id")
+				}
+				if resp.StatusCode != 429 && !(resp.StatusCode >= 500 && e.Retryable) {
+					return nil, e
+				}
+				err = e
+			}
+			delay = retryDelay(resp.Header.Get("Retry-After"), delay)
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if attempt >= c.maxRetries {
+			return nil, err
+		}
+		if err = c.sleep(ctx, delay); err != nil {
+			return nil, err
 		}
 	}
-	if err := json.Unmarshal(responseBody, output); err != nil {
-		return fmt.Errorf("decode response: %w", err)
+}
+func safeURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil || u.Fragment != "" || (u.Scheme != "https" && !(u.Scheme == "http" && (u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost" || u.Hostname() == "::1"))) {
+		return nil, errors.New("URL must be HTTPS without credentials or fragment (HTTP loopback allowed for tests)")
 	}
-	return nil
+	return u, nil
+}
+func readBounded(r io.Reader, limit int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if int64(len(b)) > limit {
+		return nil, errors.New("response exceeds byte limit")
+	}
+	return b, err
+}
+func retryDelay(raw string, minimum time.Duration) time.Duration {
+	if seconds, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 32); err == nil && seconds >= 0 {
+		if d := time.Duration(seconds) * time.Second; d > minimum {
+			return d
+		}
+	}
+	if t, err := http.ParseTime(raw); err == nil {
+		if d := time.Until(t); d > minimum {
+			return d
+		}
+	}
+	return minimum
+}
+func wait(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
