@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -271,6 +272,109 @@ func TestDownloadFailureDoesNotCreate(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatal(calls)
+	}
+}
+
+type failedDownloadBody struct{ err error }
+
+func (b failedDownloadBody) Read([]byte) (int, error) { return 0, b.err }
+func (b failedDownloadBody) Close() error             { return nil }
+
+func TestInterruptedAuthResponseDoesNotRetry(t *testing.T) {
+	for _, status := range []int{401, 403} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			calls := 0
+			c := client(t, func(*http.Request) (*http.Response, error) {
+				calls++
+				r := response(status, "", "Retry-After", "30")
+				r.Body = failedDownloadBody{io.ErrUnexpectedEOF}
+				return r, nil
+			})
+			c.sleep = func(context.Context, time.Duration) error { t.Fatal("auth error must not retry"); return nil }
+			_, err := c.CreateJob(context.Background(), SynthesisRequest{Text: "Hi", RequestID: requestID})
+			var api *APIError
+			var op *OperationError
+			if !errors.As(err, &api) || !errors.As(err, &op) || api.StatusCode != status || api.Retryable || api.RetryAfter != "30" || op.RequestID != requestID || calls != 1 {
+				t.Fatal("lost status/recovery metadata or retried permanent error")
+			}
+		})
+	}
+}
+
+func TestDownloadErrorsDoNotExposePrivateURLs(t *testing.T) {
+	for _, stage := range []string{"transport", "body", "deadline", "cancelled", "native"} {
+		t.Run(stage, func(t *testing.T) {
+			j := job("success")
+			j.Result.URL += "?signature=AUDIT_PRIVATE_CANARY"
+			c := client(t, func(*http.Request) (*http.Response, error) { t.Fatal("unexpected API request"); return nil, nil })
+			cause := error(errors.New("failed to fetch " + j.Result.URL))
+			if stage == "deadline" {
+				cause = context.DeadlineExceeded
+			}
+			if stage == "cancelled" {
+				cause = context.Canceled
+			}
+			if stage == "native" {
+				server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+				server.Close()
+				j.Result.URL = server.URL + "/audio?signature=AUDIT_PRIVATE_CANARY"
+			} else {
+				c.downloadClient = isolatedClient(&http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
+					if stage == "body" {
+						r := response(200, "")
+						r.Body = failedDownloadBody{cause}
+						return r, nil
+					}
+					return nil, cause
+				})})
+			}
+			_, err := c.Download(context.Background(), j)
+			var op *OperationError
+			if !errors.As(err, &op) || op.RequestID != requestID || op.JobID != jobID {
+				t.Fatal("missing recovery identifiers")
+			}
+			var raw *url.Error
+			if errors.As(err, &raw) {
+				t.Fatal("private URL is still reachable through errors.As")
+			}
+			for current := err; current != nil; current = errors.Unwrap(current) {
+				for _, format := range []string{"%s", "%v", "%+v", "%#v"} {
+					message := fmt.Sprintf(format, current)
+					if strings.Contains(message, "AUDIT_PRIVATE_CANARY") || strings.Contains(message, j.Result.URL) {
+						t.Fatal("private URL exposed by error formatting")
+					}
+				}
+			}
+			if (stage == "deadline" || stage == "cancelled") && !errors.Is(err, cause) {
+				t.Fatal("lost context error identity")
+			}
+		})
+	}
+}
+
+func TestReflectedErrorMetadataIsSafeToLog(t *testing.T) {
+	for _, unsafe := range []string{"fixture-key", "prefix-fixture-key-suffix", "https://audio.example.test/private?signature=CANARY"} {
+		c := client(t, func(*http.Request) (*http.Response, error) {
+			data, _ := json.Marshal(map[string]any{"error": map[string]any{"code": unsafe, "message": unsafe, "retryable": false}, "traceId": unsafe})
+			return response(401, string(data), "X-Request-Id", unsafe), nil
+		})
+		_, err := c.CreateJob(context.Background(), SynthesisRequest{Text: "Hi", RequestID: requestID})
+		var api *APIError
+		var op *OperationError
+		if !errors.As(err, &api) || !errors.As(err, &op) || op.RequestID != requestID || api.ErrorCode != "api_error" || api.TraceID != "" {
+			t.Fatal("unsafe API metadata or missing recovery ID")
+		}
+		for current := err; current != nil; current = errors.Unwrap(current) {
+			if strings.Contains(fmt.Sprintf("%s %v %+v %#v", current, current, current, current), unsafe) {
+				t.Fatal("reflected value reached error output")
+			}
+		}
+		j := job("failed")
+		j.Error = &JobFailure{Code: unsafe, Message: unsafe}
+		_, err = c.WaitJob(context.Background(), j)
+		if !errors.As(err, &op) || op.RequestID != requestID || op.JobID != jobID || strings.Contains(err.Error(), unsafe) {
+			t.Fatal("unsafe terminal error or missing IDs")
+		}
 	}
 }
 func TestRedirectsAndCookies(t *testing.T) {

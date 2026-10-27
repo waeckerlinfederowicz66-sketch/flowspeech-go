@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Use generic API error messages and filter reflected key/URL values from error codes and traces, including terminal job errors.
+- Do not retry received permanent HTTP errors or redirects when reading their response body fails.
+- Remove private download URLs from transport/body error strings and unwrap chains while preserving request/job recovery IDs and context cancellation/deadline identity. Local fix only; existing published artifacts are unchanged.
+
 ## 0.2.0
 
 - Validate RIFF/WAVE chunk sizes, 24000 Hz mono 16-bit PCM format and complete aligned nonempty audio data; preserve valid files byte-for-byte and reject malformed downloads without resubmitting.

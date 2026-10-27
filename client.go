@@ -23,6 +23,7 @@ const defaultBaseURL = "https://flowspeech.io"
 const jobsPath = "/api/v1/tts/jobs"
 
 var uuidPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+var errorTokenPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
 
 // Client is safe for concurrent use. Injected transports must be trusted: they
 // must not add credentials, cookies, or follow redirects themselves.
@@ -450,7 +451,7 @@ func (c *Client) WaitJob(ctx context.Context, j *Job) (*Job, error) {
 		case "failed", "cancelled":
 			code := ""
 			if j.Error != nil {
-				code = j.Error.Code
+				code = c.safeErrorToken(j.Error.Code, "job_failed")
 			}
 			err = fmt.Errorf("job %s: %s", j.Status, code)
 		default:
@@ -488,15 +489,30 @@ func (c *Client) Download(ctx context.Context, j *Job) ([]byte, error) {
 		} else {
 			var data []byte
 			data, err = readBounded(resp.Body, c.maxDownloadBytes)
-			if err == nil {
+			if err != nil {
+				err = downloadTransportError(err)
+			} else {
 				err = validateWAV(ctx, data)
 			}
 			if err == nil {
 				return data, nil
 			}
 		}
+	} else {
+		err = downloadTransportError(err)
 	}
 	return nil, &OperationError{RequestID: j.RequestID, JobID: j.ID, Err: err}
+}
+
+func downloadTransportError(err error) error {
+	// Do not retain URL-bearing transport errors, even in the unwrap chain.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	return errors.New("audio download failed; retry Download with the same job")
 }
 func (c *Client) Synthesize(ctx context.Context, r SynthesisRequest) (*Audio, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
@@ -538,6 +554,11 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte, 
 			var data []byte
 			data, err = readBounded(resp.Body, 1<<20)
 			resp.Body.Close()
+			if err != nil && resp.StatusCode >= 300 && resp.StatusCode < 500 && resp.StatusCode != 429 {
+				return nil, &APIError{StatusCode: resp.StatusCode, ErrorCode: "transport_error",
+					Message: "API response body could not be read", RetryAfter: resp.Header.Get("Retry-After"),
+					TraceID: c.safeErrorToken(resp.Header.Get("X-Request-Id"), "")}
+			}
 			if err == nil {
 				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 					err = json.Unmarshal(data, out)
@@ -551,12 +572,9 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte, 
 					TraceID string `json:"traceId"`
 				}
 				_ = json.Unmarshal(data, &failure)
-				e := &APIError{StatusCode: resp.StatusCode, ErrorCode: failure.Error.Code, Message: failure.Error.Message, Retryable: failure.Error.Retryable, TraceID: failure.TraceID, RetryAfter: resp.Header.Get("Retry-After")}
-				if e.Message == "" {
-					e.Message = http.StatusText(resp.StatusCode)
-				}
+				e := &APIError{StatusCode: resp.StatusCode, ErrorCode: c.safeErrorToken(failure.Error.Code, "api_error"), Message: "API request failed", Retryable: failure.Error.Retryable, TraceID: c.safeErrorToken(failure.TraceID, ""), RetryAfter: resp.Header.Get("Retry-After")}
 				if e.TraceID == "" {
-					e.TraceID = resp.Header.Get("X-Request-Id")
+					e.TraceID = c.safeErrorToken(resp.Header.Get("X-Request-Id"), "")
 				}
 				if resp.StatusCode != 429 && !(resp.StatusCode >= 500 && e.Retryable) {
 					return nil, e
@@ -576,6 +594,13 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte, 
 		}
 	}
 }
+func (c *Client) safeErrorToken(value, fallback string) string {
+	if !errorTokenPattern.MatchString(value) || strings.Contains(value, c.apiKey) {
+		return fallback
+	}
+	return value
+}
+
 func safeURL(raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" || u.User != nil || u.Fragment != "" || (u.Scheme != "https" && !(u.Scheme == "http" && (u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost" || u.Hostname() == "::1"))) {
