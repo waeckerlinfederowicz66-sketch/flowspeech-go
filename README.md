@@ -11,7 +11,8 @@ go get github.com/waeckerlinfederowicz66-sketch/flowspeech-go@v0.2.1
 Set `FLOWSPEECH_API_KEY` through your environment or secret manager. Never embed
 it in browser/mobile applications or commit it. Generation uses account credits.
 
-Version 0.2.1 is a prepared release candidate, not a publication claim.
+Version 0.2.1 includes the safety fixes below. Previously published 0.2.0
+artifacts remain unchanged.
 API and terminal-job errors use local messages and filter reflected keys and
 private URLs. Download failures omit raw transport/body causes while preserving
 recovery IDs and context cancellation/deadline identity. Received permanent HTTP

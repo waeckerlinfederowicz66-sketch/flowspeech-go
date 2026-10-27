@@ -1,10 +1,10 @@
 # Changelog
 
-## 0.2.1 - 2026-10-27 (release candidate)
+## 0.2.1 - 2026-10-27
 
 - Use generic API error messages and filter reflected key/URL values from error codes and traces, including terminal job errors.
 - Do not retry received permanent HTTP errors or redirects when reading their response body fails.
-- Remove private download URLs from transport/body error strings and unwrap chains while preserving request/job recovery IDs and context cancellation/deadline identity. Existing published artifacts are unchanged until a separate release.
+- Remove private download URLs from transport/body error strings and unwrap chains while preserving request/job recovery IDs and context cancellation/deadline identity. Previously published 0.2.0 artifacts remain unchanged.
 
 ## 0.2.0
 
