@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-const Version = "0.2.0"
+const Version = "0.2.1"
 const defaultBaseURL = "https://flowspeech.io"
 const jobsPath = "/api/v1/tts/jobs"
 

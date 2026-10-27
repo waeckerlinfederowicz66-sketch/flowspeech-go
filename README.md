@@ -5,11 +5,18 @@ Requires Go 1.22+, an active paid Basic, Pro or Scale subscription (not a trial)
 and an API key from [API settings](https://flowspeech.io/settings/apikeys).
 
 ```sh
-go get github.com/waeckerlinfederowicz66-sketch/flowspeech-go@v0.2.0
+go get github.com/waeckerlinfederowicz66-sketch/flowspeech-go@v0.2.1
 ```
 
 Set `FLOWSPEECH_API_KEY` through your environment or secret manager. Never embed
 it in browser/mobile applications or commit it. Generation uses account credits.
+
+Version 0.2.1 is a prepared release candidate, not a publication claim.
+API and terminal-job errors use local messages and filter reflected keys and
+private URLs. Download failures omit raw transport/body causes while preserving
+recovery IDs and context cancellation/deadline identity. Received permanent HTTP
+errors do not retry after an interrupted body. Do not log raw request objects or
+result URLs; custom transports and application logging remain trusted boundaries.
 
 ## Generate WAV Audio
 
